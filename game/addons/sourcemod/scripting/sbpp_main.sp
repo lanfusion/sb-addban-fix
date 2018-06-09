@@ -177,6 +177,7 @@ public OnPluginStart()
 	CreateConVar("sbr_version", SBR_VERSION, _, FCVAR_SPONLY | FCVAR_REPLICATED | FCVAR_NOTIFY);
 	RegServerCmd("sm_rehash", sm_rehash, "Reload SQL admins");
 	RegAdminCmd("sm_ban", CommandBan, ADMFLAG_BAN, "sm_ban <#userid|name> <minutes|0> [reason]", "sourcebans");
+	RegAdminCmd("sm_ban_delay", CommandBanDelay, ADMFLAG_BAN, "sm_ban <#userid|name> <minutes|0> <delay> [reason]", "sourcebans");
 	RegAdminCmd("sm_banip", CommandBanIp, ADMFLAG_BAN, "sm_banip <ip|#userid|name> <time> [reason]", "sourcebans");
 	RegAdminCmd("sm_addban", CommandAddBan, ADMFLAG_RCON, "sm_addban <time> <steamid> [reason]", "sourcebans");
 	RegAdminCmd("sm_unban", CommandUnban, ADMFLAG_UNBAN, "sm_unban <steamid|ip> [reason]", "sourcebans");
@@ -469,6 +470,109 @@ public Action:CommandBan(client, args)
 	return Plugin_Handled;
 }
 
+public Action:CommandBanDelay(client, args)
+{
+	if (args < 3)
+	{
+		ReplyToCommand(client, "%sUsage: sm_ban <#userid|name> <time|0> <delay> [reason]", Prefix);
+		return Plugin_Handled;
+	}
+
+	// This is mainly for me sanity since client used to be called admin and target used to be called client
+	new admin = client;
+
+	// Get the target, find target returns a message on failure so we do not
+	decl String:buffer[100];
+	GetCmdArg(1, buffer, sizeof(buffer));
+	new target = FindTarget(client, buffer, true);
+	if (target == -1)
+	{
+		return Plugin_Handled;
+	}
+
+	// Get the ban time
+	GetCmdArg(2, buffer, sizeof(buffer));
+	new time = StringToInt(buffer);
+	if (!time && client && !(CheckCommandAccess(client, "sm_unban", ADMFLAG_UNBAN | ADMFLAG_ROOT)))
+	{
+		ReplyToCommand(client, "You do not have Perm Ban Permission");
+		return Plugin_Handled;
+	}
+
+	// Get the delay time
+	GetCmdArg(3, buffer, sizeof(buffer));
+	new delay = StringToInt(buffer);
+	if (!delay && client && !(CheckCommandAccess(client, "sm_unban", ADMFLAG_UNBAN | ADMFLAG_ROOT)))
+	{
+		ReplyToCommand(client, "You do not have Perm Ban Permission");
+		return Plugin_Handled;
+	}
+	
+	// Get the reason
+	new String:reason[128];
+	if (args >= 4)
+	{
+		GetCmdArg(4, reason, sizeof(reason));
+		for (new i = 5; i <= args; i++)
+		{
+			GetCmdArg(i, buffer, sizeof(buffer));
+			Format(reason, sizeof(reason), "%s %s", reason, buffer);
+		}
+	}
+	else
+	{
+		reason[0] = '\0';
+	}
+
+	g_BanTarget[client] = target;
+	g_BanTime[client] = time;
+
+	if (!PlayerStatus[target])
+	{
+		// The target has not been banned verify. It must be completed before you can ban anyone.
+		ReplyToCommand(admin, "%c[%cSourceBans%c]%c %t", GREEN, NAMECOLOR, GREEN, NAMECOLOR, "Ban Not Verified");
+		return Plugin_Handled;
+	}
+
+	new Handle:dataPack = CreateDataPack();
+	WritePackCell(dataPack, client);
+	WritePackCell(dataPack, target);
+	WritePackCell(dataPack, time);
+	WritePackString(dataPack, reason);
+	
+	new String:ip[128], String:auth[64], String:name[64];
+	
+	GetClientName(target, name, sizeof(name));
+	GetClientIP(target, ip, sizeof(ip));
+	if (!GetClientAuthId(target, AuthId_Steam2, auth, sizeof(auth)))
+		return Plugin_Handled;
+	
+	WritePackString(dataPack, ip);
+	WritePackString(dataPack, auth);
+	WritePackString(dataPack, name);
+	
+	CreateTimer(float(delay), Timer_DelayAddBan, dataPack);
+	
+	return Plugin_Handled;
+}
+
+public Action:Timer_DelayAddBan(Handle:timer, Handle:dataPack)
+{
+	ResetPack(dataPack);
+	new client = ReadPackCell(dataPack);
+	new target = ReadPackCell(dataPack);
+	new time = ReadPackCell(dataPack);
+	
+	new String:reason[128], String:clientip[128], String:clientauth[64], String:clientname[64];
+	ReadPackString(dataPack, reason, sizeof(reason));
+	ReadPackString(dataPack, clientip, sizeof(clientip));
+	ReadPackString(dataPack, clientauth, sizeof(clientauth));
+	ReadPackString(dataPack, clientname, sizeof(clientname));
+	
+	CreateBanDelay(client, target, time, clientip, clientauth, clientname, reason);
+	return Plugin_Stop;
+}
+
 public Action:CommandBanIp(client, args)
 {
 	if (args < 2)
@@ -621,6 +725,79 @@ public Action:CommandAddBan(client, args)
 	if ((len = BreakString(arg_string, time, sizeof(time))) == -1)
 	{
 		ReplyToCommand(client, "%sUsage: sm_addban <time> <steamid> [reason]", Prefix);
+		return Plugin_Handled;
+	}
+	total_len += len;
+
+	/* Get steamid */
+	if ((len = BreakString(arg_string[total_len], authid, sizeof(authid))) != -1)
+	{
+		total_len += len;
+	}
+	else
+	{
+		total_len = 0;
+		arg_string[0] = '\0';
+	}
+
+	decl String:adminIp[24], String:adminAuth[64];
+	new minutes = StringToInt(time);
+	if (!minutes && client && !(CheckCommandAccess(client, "sm_unban", ADMFLAG_UNBAN | ADMFLAG_ROOT)))
+	{
+		ReplyToCommand(client, "You do not have Perm Ban Permission");
+		return Plugin_Handled;
+	}
+	if (!client)
+	{
+		// setup dummy adminAuth and adminIp for server
+		strcopy(adminAuth, sizeof(adminAuth), "STEAM_ID_SERVER");
+		strcopy(adminIp, sizeof(adminIp), ServerIp);
+	} else {
+		GetClientIP(client, adminIp, sizeof(adminIp));
+		GetClientAuthId(client, AuthId_Steam2, adminAuth, sizeof(adminAuth));
+	}
+
+	// Pack everything into a data pack so we can retain it
+	new Handle:dataPack = CreateDataPack();
+	WritePackCell(dataPack, client);
+	WritePackCell(dataPack, minutes);
+	WritePackString(dataPack, arg_string[total_len]);
+	WritePackString(dataPack, authid);
+	WritePackString(dataPack, adminAuth);
+	WritePackString(dataPack, adminIp);
+
+	decl String:Query[256];
+	FormatEx(Query, sizeof(Query), "SELECT bid FROM %s_bans WHERE type = 0 AND authid = '%s' AND (length = 0 OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL",
+		DatabasePrefix, authid);
+
+	SQL_TQuery(DB, SelectAddbanCallback, Query, dataPack, DBPrio_High);
+	return Plugin_Handled;
+}
+
+public Action:CommandAddBanFullInfo(client, args)
+{
+	if (args < 4)
+	{
+		ReplyToCommand(client, "%sUsage: sm_addban <time> <steamid> <ip> <name> [reason]", Prefix);
+		return Plugin_Handled;
+	}
+
+	if (CommandDisable & DISABLE_ADDBAN)
+	{
+		// They must go to the website to add bans
+		ReplyToCommand(client, "%s%t", Prefix, "Can Not Add Ban", WebsiteAddress);
+		return Plugin_Handled;
+	}
+
+	decl String:arg_string[256], String:time[50], String:authid[50];
+	GetCmdArgString(arg_string, sizeof(arg_string));
+
+	new len, total_len;
+
+	/* Get time */
+	if ((len = BreakString(arg_string, time, sizeof(time))) == -1)
+	{
+		ReplyToCommand(client, "%sUsage: sm_addban <time> <steamid> <ip> <name> [reason]", Prefix);
 		return Plugin_Handled;
 	}
 	total_len += len;
@@ -2309,6 +2486,89 @@ public bool:CreateBan(client, target, time, String:reason[])
 	WritePackCell(dataPack, target);
 	WritePackCell(dataPack, userid);
 	WritePackCell(dataPack, GetClientUserId(target));
+	WritePackCell(dataPack, time);
+	WritePackCell(dataPack, _:reasonPack);
+	WritePackString(dataPack, name);
+	WritePackString(dataPack, auth);
+	WritePackString(dataPack, ip);
+	WritePackString(dataPack, adminAuth);
+	WritePackString(dataPack, adminIp);
+
+	ResetPack(dataPack);
+	ResetPack(reasonPack);
+
+	if (reason[0] != '\0')
+	{
+		// if we have a valid reason pass move forward with the ban
+		if (DB != INVALID_HANDLE)
+		{
+			UTIL_InsertBan(time, name, auth, ip, reason, adminAuth, adminIp, dataPack);
+		} else {
+			UTIL_InsertTempBan(time, name, auth, ip, reason, adminAuth, adminIp, dataPack);
+		}
+	} else {
+		// We need a reason so offer the administrator a menu of reasons
+		PlayerDataPack[admin] = dataPack;
+		DisplayMenu(ReasonMenuHandle, admin, MENU_TIME_FOREVER);
+		ReplyToCommand(admin, "%c[%cSourceBans%c]%c %t", GREEN, NAMECOLOR, GREEN, NAMECOLOR, "Check Menu");
+	}
+
+	Call_StartForward(g_hFwd_OnBanAdded);
+	Call_PushCell(client);
+	Call_PushCell(target);
+	Call_PushCell(time);
+	Call_PushString(reason);
+	Call_Finish();
+
+	return true;
+}
+
+public bool:CreateBanDelay(client, target, time, String:clientip[], String:clientauth[], String:clientname[], String:reason[])
+{
+	decl String:adminIp[24], String:adminAuth[64];
+	new admin = client;
+
+	// The server is the one calling the ban
+	if (!admin)
+	{
+		if (reason[0] == '\0')
+		{
+			// We cannot pop the reason menu if the command was issued from the server
+			PrintToServer("%s%T", Prefix, "Include Reason", LANG_SERVER);
+			return false;
+		}
+
+		// setup dummy adminAuth and adminIp for server
+		strcopy(adminAuth, sizeof(adminAuth), "STEAM_ID_SERVER");
+		strcopy(adminIp, sizeof(adminIp), ServerIp);
+	} else {
+		GetClientIP(admin, adminIp, sizeof(adminIp));
+		GetClientAuthId(admin, AuthId_Steam2, adminAuth, sizeof(adminAuth));
+	}
+
+	// target information
+	decl String:ip[24], String:auth[64], String:name[64];
+
+	Format(ip, sizeof(ip), "%s", clientip);
+	Format(auth, sizeof(auth), "%s", clientauth);
+	Format(name, sizeof(name), "%s", clientname);
+
+	new userid = admin ? GetClientUserId(admin) : 0;
+
+	// Pack everything into a data pack so we can retain it
+	new Handle:dataPack = CreateDataPack();
+	new Handle:reasonPack = CreateDataPack();
+	WritePackString(reasonPack, reason);
+
+	WritePackCell(dataPack, admin);
+	WritePackCell(dataPack, target);
+	WritePackCell(dataPack, userid);
+	
+	if(IsClientConnected(target))
+		WritePackCell(dataPack, GetClientUserId(target));
+	else
+		WritePackCell(dataPack, -1);
+	
 	WritePackCell(dataPack, time);
 	WritePackCell(dataPack, _:reasonPack);
 	WritePackString(dataPack, name);
